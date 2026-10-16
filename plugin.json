@@ -3,9 +3,9 @@
   "name": "QwenPaw内部调试工具",
   "version": "0.1.0",
   "type": "tool",
-  "description": "QwenPaw 宿主内部调试套件：按会话启动专属 Python 调试 REPL 线程（持久 namespace，导入与变量跨调用保留），用 eval 实时执行代码查看/修改宿主运行时状态（线程、模块、事件循环 _loop 等），stdout/stderr 与 traceback 一并返回，超时不卡工具调用。stop 通过退出事件停止线程，超时未结束判为卡死并建议重启宿主。工具拥有宿主进程内任意代码执行权限，默认关闭，需显式开启。",
+  "description": "QwenPaw 宿主内部调试套件：按会话启动专属 Python 调试 REPL 线程（持久 namespace，导入与变量跨调用保留），用 eval 实时执行代码查看/修改宿主运行时状态（线程、模块、事件循环 _loop 等），仅 print() 输出与 traceback 一并返回，超时不卡工具调用。stop 通过退出事件停止线程，超时未结束期间禁止再 start（线程自行退出后可直接 start，持续卡死需重启宿主）。工具拥有宿主进程内任意代码执行权限，默认关闭，需显式开启。",
   "description_i18n": {
-    "zh-CN": "QwenPaw 宿主内部调试套件：按会话启动专属 Python 调试 REPL 线程（持久 namespace），eval 实时执行代码调试宿主内部，stop 经退出事件停止（超时判卡死）。任意代码执行权限，默认关闭，需显式开启。",
+    "zh-CN": "QwenPaw 宿主内部调试套件：按会话启动专属 Python 调试 REPL 线程（持久 namespace），eval 实时执行代码调试宿主内部，stop 经退出事件停止（超时未结束期间禁止再 start，线程退出后可直接 start，持续卡死需重启宿主）。任意代码执行权限，默认关闭，需显式开启。",
     "en-US": "In-host debug suite for QwenPaw: per-session Python REPL thread with persistent namespace, real-time eval against host internals, event-based stop (stuck threads require host restart). Arbitrary code execution, disabled by default."
   },
   "author": "onesixth",
@@ -33,7 +33,7 @@
       },
       {
         "name": "internal_debug_tools_stop",
-        "description": "通过退出事件停止本会话的内部调试线程（幂等：没有线程直接成功；最多等待 timeout 秒，超时未结束判为卡死，本会话禁止再 start，需重启宿主）。",
+        "description": "通过退出事件停止本会话的内部调试线程（幂等：没有线程直接成功；最多等待 timeout 秒，超时未结束期间禁止再 start——线程自行退出后可直接 start，持续卡死需重启宿主）。",
         "icon": "⏹️",
         "category": "runtime"
       }

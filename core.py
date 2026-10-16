@@ -7,7 +7,8 @@
 - 执行全程 BaseException 级保护：用户代码抛 SystemExit、裸 except
   甚至引擎自身异常都不会让线程 raise 退出；
 - stop 通过 threading.Event 设置退出信号，join 最多 timeout 秒；
-  超时未结束 → 线程标记卡死，本会话禁止再 start，只能重启宿主；
+  超时未结束 → 线程标记卡死，本会话禁止再 start（线程自行退出后
+  可直接 start 自愈），持续卡死只能重启宿主；
 - start / stop 均幂等：start 是否新建完全取决于旧线程是否已结束。
 """
 
@@ -47,11 +48,12 @@ DEFAULT_STOP_TIMEOUT = 60.0
 STATUS_CREATED = "created"    # 本次调用新建了线程
 STATUS_RUNNING = "running"    # 已有存活线程（幂等）
 STATUS_STUCK = "stuck"        # 旧线程 stop 未退出，拒绝新建
+STATUS_CREATE_FAILED = "create_failed"  # 线程创建失败（资源耗尽等）
 
 
 def _clamp_eval_timeout(timeout: Optional[float]) -> float:
-    """归一化 eval 等待时长：≤0/None 回默认 30s，上限 900s（15 分钟）。"""
-    if timeout is None or timeout <= 0:
+    """归一化 eval 等待时长：非数值/≤0/None 回默认 30s，上限 900s（15 分钟）。"""
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
         return DEFAULT_EVAL_TIMEOUT
     return min(float(timeout), MAX_EVAL_TIMEOUT)
 
@@ -66,6 +68,43 @@ def _clip(text: str, limit: int) -> Tuple[str, bool]:
     )
 
 
+def _clean_tb(exc: BaseException) -> str:
+    """格式化异常链为文本，剔除引擎帧（core.py），只留用户代码帧。
+
+    SyntaxError 回退 exec 等场景会产生多层异常链，逐层处理：
+    每层保留 <internal-debug> 用户帧与异常行，引擎帧（core.py）剔除。
+    """
+    chain = []
+    cur: Optional[BaseException] = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__  # 注：忽略 __suppress_context__（raise X from None），调试 REPL 多显示上下文反而有用，有意偏离标准语义
+    parts = []
+    for idx, item in enumerate(reversed(chain)):  # 最老的异常先输出
+        if idx > 0:
+            newer = chain[-idx]  # 比 item 晚一层的异常
+            if newer.__cause__ is not None:
+                parts.append(
+                    "\nThe above exception was the direct cause "
+                    "of the following exception:\n\n"
+                )
+            else:
+                parts.append(
+                    "\nDuring handling of the above exception, "
+                    "another exception occurred:\n\n"
+                )
+        parts.append("Traceback (most recent call last):\n")
+        frames = [
+            f for f in traceback.extract_tb(item.__traceback__)
+            if "core.py" not in (f.filename or "")
+        ]
+        parts.extend(traceback.format_list(frames))
+        parts.extend(traceback.format_exception_only(type(item), item))
+    return "".join(parts)
+
+
 def _safe_repr(value: Any) -> str:
     """repr 的保护版：对象 __repr__ 抛异常时不炸。"""
     try:
@@ -77,20 +116,44 @@ def _safe_repr(value: Any) -> str:
             return "<repr 失败>"
 
 
+MAX_CAPTURE_BUFFER_CHARS = 4 * 1024 * 1024  # 单任务 print 捕获缓冲上限（4MB）
+
+
 def _make_capturing_print(buf_out: io.StringIO):
     """构造写入 buf 的捕获版 print（注入 namespace 用）。
 
     eval/exec 的 globals 查找先于 builtins，注入后用户代码的 print
     自然命中本函数。不用 contextlib.redirect_stdout：那是进程级
     sys.stdout 全局替换，多线程下会劫持宿主其他线程的输出，且任务
-    卡死时劫持永不恢复。file= 参数透传真实 print。
+    卡死时劫持永不恢复。file= 参数透传真实 print。缓冲超 4MB 丢弃
+    后续写入（死循环 print 的 OOM 防线）。
     """
+    state = {"overflow": False}
 
     def _print(*args, sep=" ", end="\n", file=None, flush=False):
         if file is not None:
             builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
             return
-        buf_out.write(sep.join(str(a) for a in args) + end)
+        if state["overflow"]:
+            return
+        text = sep.join(str(a) for a in args) + end
+        remain = MAX_CAPTURE_BUFFER_CHARS - buf_out.tell()
+        if remain <= 0:
+            buf_out.write(
+                f"\n…[print 输出超过 {MAX_CAPTURE_BUFFER_CHARS // (1024 * 1024)}MB"
+                "字符缓冲上限，后续输出丢弃]"
+            )
+            state["overflow"] = True
+            return
+        if len(text) > remain:  # 单次大写入也按剩余配额截断
+            buf_out.write(text[:remain])
+            buf_out.write(
+                f"\n…[print 输出超过 {MAX_CAPTURE_BUFFER_CHARS // (1024 * 1024)}MB"
+                "字符缓冲上限，后续输出丢弃]"
+            )
+            state["overflow"] = True
+            return
+        buf_out.write(text)
 
     return _print
 
@@ -179,17 +242,39 @@ class DebugThread:
                 ),
             }
         timeout = _clamp_eval_timeout(timeout)
+        if threading.current_thread() is self._thread:
+            # 调试线程内的代码调 eval：会自我等待直到超时，直接拒绝
+            return {
+                "ok": False,
+                "state": "self_eval",
+                "note": (
+                    "在调试线程内部调用了 eval：会等待自身执行直到超时，"
+                    "已拒绝。请在其他线程（如宿主工具调用）中使用 eval。"
+                ),
+            }
         future: concurrent.futures.Future = concurrent.futures.Future()
         self._queue.put((code, future, loop_ref))
         try:
             return future.result(timeout)
         except concurrent.futures.TimeoutError:
+            if self._stop_event.is_set():
+                # stop 竞态窗口：任务可能排在退出哨兵之后被丢弃，永不执行
+                return {
+                    "ok": False,
+                    "timed_out": True,
+                    "note": (
+                        f"等待 {timeout}s 超时，且调试线程已收到退出信号，"
+                        "本次提交可能已被丢弃（stop 之后任务不再执行）。"
+                        "请先调用 internal_debug_tools_stop 确认线程状态。"
+                    ),
+                }
             return {
                 "ok": False,
                 "timed_out": True,
                 "note": (
-                    f"等待 {timeout}s 超时，代码仍在调试线程中继续执行"
-                    "（可能死循环/阻塞）。可再次 eval 查看进展，"
+                    f"等待 {timeout}s 超时，代码可能仍在排队或执行中"
+                    "（调试线程串行执行，前方任务未完成时新任务排队等待，"
+                    "等待计时包含排队时间）。可稍后再次 eval 查看进展，"
                     "或 stop 停止线程。"
                 ),
             }
@@ -206,8 +291,21 @@ class DebugThread:
                 "already": True,
                 "note": "调试线程已结束，无需停止（幂等）。",
             }
+        if not isinstance(timeout, (int, float)):
+            timeout = DEFAULT_STOP_TIMEOUT  # 非数值防御，回落默认 60s
         self._stop_event.set()
         self._queue.put(None)  # 哨兵：让阻塞在 get() 的线程立刻醒来
+        if self._thread is threading.current_thread():
+            # 调试线程内的代码调 stop：join 自己会 RuntimeError，只设信号
+            return {
+                "ok": True,
+                "stopped": False,
+                "signal_only": True,
+                "note": (
+                    "在调试线程内部调用了 stop：退出信号已设置，当前任务"
+                    "完成后线程将自行退出（无法在内部等待自身结束）。"
+                ),
+            }
         if not (timeout and timeout > 0):
             return {
                 "ok": True,
@@ -225,9 +323,10 @@ class DebugThread:
                 "stopped": False,
                 "stuck": True,
                 "note": (
-                    "已设置退出信号，但线程尚未结束，调试线程可能在死锁或"
-                    "繁忙。本会话已无法启动新调试线程，推荐手动重启宿主，"
-                    "让卡住的线程随进程消失后再使用。"
+                    "已设置退出信号，但线程尚未结束（可能在执行长任务或"
+                    "死锁）。线程退出前本会话无法 start 新调试线程；若线程"
+                    "最终自行退出，可直接重新 start；持续卡死才需重启宿主。"
+                    "可稍后再次 stop 查看是否已退出。"
                 ),
             }
         return {
@@ -264,6 +363,25 @@ class DebugThread:
                 logger.exception("internal-debug 回传结果异常")
 
     def _safe_execute(self, code: str, loop_ref: Any) -> Dict[str, Any]:
+        """引擎级最后防线：内层执行任何逃逸异常都折叠为结果 dict。
+
+        保证"线程绝不 raise 退出"的承诺覆盖到执行引擎自身
+        （如极端边缘下 format_exception / getvalue 再抛异常）。
+        """
+        try:
+            return self._safe_execute_inner(code, loop_ref)
+        except BaseException as e:  # noqa: BLE001
+            logger.exception("internal-debug 执行引擎异常")
+            return {
+                "ok": False,
+                "result": None,
+                "stdout": "",
+                "truncated": False,
+                "error": f"调试引擎内部异常（任务未执行或结果丢失）: {e!r}",
+                "elapsed_ms": 0,
+            }
+
+    def _safe_execute_inner(self, code: str, loop_ref: Any) -> Dict[str, Any]:
         """执行一段代码，任何异常都折叠为结果 dict，绝不向外抛。"""
         t0 = time.monotonic()
         result: Dict[str, Any] = {
@@ -288,10 +406,7 @@ class DebugThread:
                 value = self._exec_capture(code)
         except BaseException as e:  # noqa: BLE001  用户代码异常也不能杀线程
             result["ok"] = False
-            tb = "".join(
-                traceback.format_exception(type(e), e, e.__traceback__)
-            )
-            tb_clipped, trunc = _clip(tb, MAX_STREAM_CHARS)
+            tb_clipped, trunc = _clip(_clean_tb(e), MAX_STREAM_CHARS)
             result["error"] = tb_clipped
             result["truncated"] = result["truncated"] or trunc
         finally:
@@ -350,7 +465,8 @@ class DebugManager:
         返回 (线程, 是否新建, 状态)。状态：
         - created：新建成功；
         - running：已有存活线程，幂等返回；
-        - stuck：旧线程收到退出信号但未结束（卡死），拒绝新建。
+        - stuck：旧线程收到退出信号但未结束（卡死），拒绝新建；
+        - create_failed：线程创建失败（返回的线程为 None）。
         """
         with self._lock:
             old = self._threads.get(key)
@@ -358,7 +474,11 @@ class DebugManager:
                 if old.stop_requested:
                     return old, False, STATUS_STUCK
                 return old, False, STATUS_RUNNING
-            dt = DebugThread(key)
+            try:
+                dt = DebugThread(key)
+            except Exception as e:  # noqa: BLE001  线程资源耗尽等
+                logger.error("创建调试线程失败: %s", e)
+                return None, False, STATUS_CREATE_FAILED
             self._threads[key] = dt
             return dt, True, STATUS_CREATED
 
@@ -368,6 +488,9 @@ class DebugManager:
         """取可执行任务的线程；不可用时返回 (None, 错误说明)。"""
         with self._lock:
             dt = self._threads.get(key)
+            if dt is not None and not dt.is_alive():
+                # 顺手清掉死亡线程的注册条目（释放 namespace 持有的引用）
+                self._threads.pop(key, None)
         if dt is None:
             return None, (
                 "本会话尚未启动调试线程，请先调用 internal_debug_tools_start。"
@@ -379,8 +502,8 @@ class DebugManager:
         if dt.stop_requested:
             return None, (
                 "调试线程已收到退出信号（正在退出或卡死），无法执行任务。"
-                "请调用 internal_debug_tools_stop 确认状态；若线程卡死，"
-                "推荐重启宿主。"
+                "请调用 internal_debug_tools_stop 确认状态；线程退出后可直接"
+                "重新 start，持续卡死才需重启宿主。"
             )
         return dt, None
 

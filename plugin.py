@@ -59,7 +59,8 @@ class InternalDebugToolsPlugin:
             tool_func=internal_debug_tools_stop,
             description=(
                 "通过退出事件停止本会话的内部调试线程（幂等；"
-                "超时未结束判为卡死，需重启宿主）。"
+                "超时未结束期间禁止再 start，线程退出后可直接"
+                "重新 start，持续卡死才需重启宿主）。"
             ),
             icon="⏹️",
             enabled=False,

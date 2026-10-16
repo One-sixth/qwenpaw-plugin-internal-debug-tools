@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "internal_debug_tools_start",
-      "description": "启动本会话专属的内部调试 REPL 线程（幂等）。线程内持有一个持久 namespace，配合 internal_debug_tools_eval 实时执行 Python 代码调试 QwenPaw 宿主内部；已在运行时只返回状态不新建；上次 stop 超时未退出的卡死线程会拒绝启动并建议重启宿主。",
+      "description": "启动本会话专属的内部调试 REPL 线程（幂等）。线程内持有一个持久 namespace，配合 internal_debug_tools_eval 实时执行 Python 代码调试 QwenPaw 宿主内部；已在运行时只返回状态不新建；上次 stop 超时未退出的线程会拒绝启动——线程退出后可直接重新 start，持续卡死才需重启宿主。",
       "parameters": {
         "properties": {},
         "type": "object"
@@ -14,7 +14,7 @@
     "type": "function",
     "function": {
       "name": "internal_debug_tools_stop",
-      "description": "停止本会话的内部调试线程（幂等：没有线程时直接成功）。通过退出事件通知线程结束并最多等待 timeout 秒；超时未结束时线程标记为卡死，本会话将无法再次 start，需要重启宿主清除卡住线程。",
+      "description": "停止本会话的内部调试线程（幂等：没有线程时直接成功）。通过退出事件通知线程结束并最多等待 timeout 秒；超时未结束期间本会话将无法再次 start——线程自行退出后可直接重新 start，持续卡死才需重启宿主。",
       "parameters": {
         "properties": {
           "timeout": {

@@ -13,8 +13,9 @@ import time
 import pytest
 
 from core import (DEFAULT_EVAL_TIMEOUT, MAX_EVAL_TIMEOUT, MAX_RESULT_CHARS,
-                  DebugManager, DebugThread, STATUS_CREATED, STATUS_RUNNING,
-                  STATUS_STUCK, _clamp_eval_timeout)
+                  STATUS_CREATE_FAILED, STATUS_CREATED, STATUS_RUNNING,
+                  STATUS_STUCK, DebugManager, DebugThread,
+                  _clamp_eval_timeout)
 
 FAKE_KEY = ("agent-t", "user-t", "session-test-core")
 
@@ -24,11 +25,6 @@ def make_thread() -> DebugThread:
 
 
 def make_manager() -> DebugManager:
-    return DebugManager()
-
-
-def stopped_manager() -> DebugManager:
-    """确保测试留下的线程都已停止，返回其 manager。"""
     return DebugManager()
 
 
@@ -263,6 +259,184 @@ class TestStopAndStateMachine:
         assert dt.stop_requested is True
         dt._thread.join(5)
         assert dt.is_alive() is False
+
+
+    def test_queued_timeout_note_mentions_queueing(self):
+        """排队超时：前序长任务占线时，note 应说明可能仍在排队。"""
+        mgr = make_manager()
+        mgr.start(FAKE_KEY)
+        dt = mgr.get_ready(FAKE_KEY)[0]
+        dt.eval("time.sleep(1.5)", timeout=0.2)  # 占线，超时放弃
+        r = dt.eval("42", timeout=0.5)  # 新任务排队，等待计时含排队时间
+        assert r.get("timed_out") is True
+        assert "排队" in r["note"]
+
+    def test_stuck_self_heals_when_thread_exits_later(self):
+        """stuck 自愈：卡住的是长任务时线程会自行退出，start 随后恢复。"""
+        mgr = make_manager()
+        mgr.start(FAKE_KEY)
+        dt = mgr.get_ready(FAKE_KEY)[0]
+        dt.eval("time.sleep(1)", timeout=0.2)  # 长任务占线
+        dt.stop(timeout=0)  # signal_only：设退出信号，不等待
+        _, created, state = mgr.start(FAKE_KEY)
+        assert state == STATUS_STUCK  # 线程仍活着 → 拒绝
+        time.sleep(1.5)  # 任务结束，线程检查退出信号自行退出
+        assert dt.is_alive() is False
+        dt2, created, state = mgr.start(FAKE_KEY)
+        assert state == STATUS_CREATED and created is True  # 自愈，无需重启
+
+
+class TestHardening:
+    """复审加固项回归：缓冲上限、构造失败折叠。"""
+
+    def test_print_buffer_overflow(self):
+        from core import MAX_CAPTURE_BUFFER_CHARS, _make_capturing_print
+
+        buf = io.StringIO()
+        p = _make_capturing_print(buf)
+        p("x" * (MAX_CAPTURE_BUFFER_CHARS // 2))
+        p("y" * (MAX_CAPTURE_BUFFER_CHARS // 2))  # 触发超限
+        p("z" * 1000)  # 超限后丢弃
+        text = buf.getvalue()
+        assert "缓冲上限" in text
+        assert "z" * 1000 not in text
+        assert len(text) < MAX_CAPTURE_BUFFER_CHARS + 200
+
+    def test_print_single_huge_write_also_capped(self):
+        """单次巨量 print 也不能穿透缓冲（第二轮复审 P1）。"""
+        from core import MAX_CAPTURE_BUFFER_CHARS, _make_capturing_print
+
+        buf = io.StringIO()
+        p = _make_capturing_print(buf)
+        p("x" * (MAX_CAPTURE_BUFFER_CHARS * 2))  # 一次写 8MB
+        text = buf.getvalue()
+        assert len(text) < MAX_CAPTURE_BUFFER_CHARS + 200
+        assert "缓冲上限" in text
+        p("more")  # 溢出后丢弃
+        assert len(buf.getvalue()) == len(text)
+
+    def test_clean_tb_circular_reference(self):
+        """异常链循环引用不死循环（第二轮复审覆盖缺口）。"""
+        from core import _clean_tb
+
+        a = ValueError("a")
+        b = KeyError("b")
+        a.__cause__ = b
+        b.__context__ = a  # 构造循环
+        text = _clean_tb(a)
+        assert "ValueError" in text and "KeyError" in text
+
+    def test_format_stopping_and_timed_out_branches(self):
+        from tools.eval import _format
+
+        assert _format({"state": "stopping", "note": "stopping-note"}) == \
+            "stopping-note"
+        assert _format({"timed_out": True, "note": "timeout-note"}) == \
+            "timeout-note"
+
+    def test_self_eval_rejected(self):
+        """调试线程内调 dt.eval：self_eval 拒绝，不自我等待（与 stop 对称）。"""
+        dt = make_thread()
+        dt._namespace["me"] = dt
+        r = dt.eval("me.eval('1+1', timeout=5)", timeout=5)
+        # 外层任务正常完成；内层调用的 self_eval dict 作为表达式值的 repr
+        assert r["ok"] is True
+        assert "'self_eval'" in r["result"]
+        assert "已拒绝" in r["result"]
+        dt._stop_event.set()  # 收尾：让线程退出
+        dt._queue.put(None)
+        dt._thread.join(5)
+        assert dt.is_alive() is False
+
+    def test_clamp_rejects_non_numeric(self):
+        assert _clamp_eval_timeout("30") == DEFAULT_EVAL_TIMEOUT
+        assert _clamp_eval_timeout(None) == DEFAULT_EVAL_TIMEOUT
+
+    def test_start_create_failure_folding(self, monkeypatch):
+        """线程创建失败折叠为 create_failed，不向工具协程抛异常。"""
+        import core as core_mod
+
+        class Boom:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(core_mod.threading, "Thread", Boom)
+        mgr = make_manager()
+        dt, created, state = mgr.start(FAKE_KEY)
+        assert dt is None
+        assert created is False
+        assert state == STATUS_CREATE_FAILED
+
+    def test_stop_inside_debug_thread_signal_only(self):
+        """调试线程内的代码调 stop：不 join 自己，折叠为 signal_only。
+
+        宿主内实测发现：eval("me.stop(1)") 会触发
+        RuntimeError: cannot join current thread（已被任务级保护折叠，
+        线程不死），修复后应返回 signal_only 且线程随后自行退出。
+        """
+        dt = make_thread()
+        dt._namespace["me"] = dt
+        r = dt.eval("me.stop(5)", timeout=5)
+        assert r["ok"] is True
+        assert "signal_only" in r["result"]
+        dt._thread.join(5)
+        assert dt.is_alive() is False  # 信号已设，任务完成后线程退出
+
+
+class TestFormatAndCleanTb:
+    """新格式（耗时前置+分区）与 traceback 引擎帧过滤。"""
+
+    def test_clean_tb_filters_engine_frames(self):
+        dt = make_thread()
+        r = dt.eval("1/0", timeout=5)
+        assert "core.py" not in r["error"]
+        assert "ZeroDivisionError: division by zero" in r["error"]
+        assert 'File "<internal-debug>"' in r["error"]
+
+    def test_clean_tb_keeps_double_chain(self):
+        # SyntaxError 回退 exec 再炸：双层链，每层都只留用户帧
+        dt = make_thread()
+        r = dt.eval('data = {"a": 1}\ndata["b"]', timeout=5)
+        assert "core.py" not in r["error"]
+        assert "During handling" in r["error"]
+        assert r["error"].rstrip().endswith("KeyError: 'b'")
+
+    def test_format_success_minimal(self):
+        from tools.eval import _format
+
+        text = _format({"ok": True, "result": "1024", "stdout": "",
+                        "truncated": False, "elapsed_ms": 3})
+        assert text.splitlines()[0] == "⏱ 3ms"
+        assert "——return——\n1024" in text
+        assert "——output——" not in text
+
+    def test_format_success_with_stdout(self):
+        from tools.eval import _format
+
+        text = _format({"ok": True, "result": "45", "stdout": "line1\nline2\n",
+                        "truncated": False, "elapsed_ms": 1})
+        assert "——return——\n45\n——output——\nline1\nline2\n" in text
+
+    def test_format_error_sections(self):
+        from tools.eval import _format
+
+        err = ('Traceback (most recent call last):\n'
+               '  File "<internal-debug>", line 2, in <module>\n'
+               "KeyError: 'b'")
+        text = _format({"ok": False, "error": err, "stdout": "",
+                        "truncated": False, "elapsed_ms": 8})
+        assert text.splitlines()[0] == "⏱ 8ms"
+        assert "——exception——\nKeyError: 'b'" in text
+        assert "——traceback——" in text
+
+    def test_exception_summary(self):
+        from tools.eval import _exception_summary
+
+        assert _exception_summary("a\nb\nKeyError: 'b'") == "KeyError: 'b'"
+        assert _exception_summary("") == "未知异常"
 
 
 # ── eval 状态守卫 ─────────────────────────────────────────

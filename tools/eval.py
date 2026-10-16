@@ -14,23 +14,33 @@ except ImportError:  # 兼容 pytest 直接以项目根导入
 
 
 def _format(result: dict) -> str:
-    """把执行结果 dict 格式化为人类可读文本。"""
+    """把执行结果 dict 格式化为分区文本：耗时在首行，区段以——标题——分隔。"""
     if result.get("state") == "stopping":
         return result.get("note", "调试线程正在退出，无法执行。")
     if result.get("timed_out"):
         return result.get("note", "执行超时。")
 
-    parts = ["✅ 执行成功" if result.get("ok") else "❌ 执行出错"]
+    parts = [f"⏱ {result.get('elapsed_ms', 0)}ms"]
     if result.get("ok"):
-        parts.append(f"结果: {result.get('result')}")
+        parts.append("——return——")
+        parts.append(str(result.get("result")))
+        stdout = result.get("stdout")
+        if stdout:
+            parts.append("——output——")
+            parts.append(stdout)
     else:
-        parts.append(f"异常 traceback:\n{result.get('error', '')}")
-    if result.get("stdout"):
-        parts.append(f"print 输出:\n{result['stdout']}")
-    parts.append(f"耗时: {result.get('elapsed_ms')}ms")
-    if result.get("truncated"):
-        parts.append("（输出过长已截断）")
+        parts.append("——exception——")
+        parts.append(_exception_summary(result.get("error", "")))
+        parts.append("")
+        parts.append("——traceback——")
+        parts.append(result.get("error", ""))
     return "\n".join(parts)
+
+
+def _exception_summary(tb_text: str) -> str:
+    """从 traceback 文本提取异常摘要（最后一个非空行，如 KeyError: 'b'）。"""
+    lines = [line for line in tb_text.splitlines() if line.strip()]
+    return lines[-1] if lines else "未知异常"
 
 
 async def internal_debug_tools_eval(code: str, timeout: float = DEFAULT_EVAL_TIMEOUT):
